@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = 'Coldline-Inspired Alarm Clock for BLARE\.pio\build\seeed_xiao_esp32c3\firmware.bin'
+elf = 'Coldline-Inspired Alarm Clock for BLARE\.pio\build\seeed_xiao_esp32c3\firmware.elf'
