@@ -38,28 +38,38 @@
       "attrs": {}
     },
     { "type": "wokwi-vcc", "id": "vcc2", "top": 19.96, "left": 211.2, "attrs": {} },
-    { "type": "wokwi-gnd", "id": "gnd2", "top": 30.2, "left": 172.6, "rotate": 180, "attrs": {} }
+    { "type": "wokwi-gnd", "id": "gnd2", "top": 30.2, "left": 172.6, "rotate": 180, "attrs": {} },
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz1",
+      "top": 211.2,
+      "left": 28.8,
+      "rotate": 180,
+      "attrs": { "volume": "0.1" }
+    }
   ],
   "connections": [
     [ "gnd1:GND", "btn1:2.l", "black", [ "v0" ] ],
     [ "gnd1:GND", "btn2:2.l", "black", [ "v0" ] ],
     [ "gnd1:GND", "btn4:2.l", "black", [ "v0" ] ],
-    [ "btn4:1.r", "esp:D1", "orange", [ "v0", "h86.6", "v76.8" ] ],
-    [ "btn2:1.r", "esp:D2", "orange", [ "v0", "h77", "v38.4" ] ],
-    [ "btn1:1.r", "esp:D3", "orange", [ "v0" ] ],
-    [ "encoder1:CLK", "esp:D4", "cyan", [ "h9.6", "v-38.4" ] ],
-    [ "encoder1:DT", "esp:D5", "yellow", [ "h19.2", "v-38.3" ] ],
-    [ "encoder1:SW", "esp:D6", "orange", [ "h28.8", "v-38.3" ] ],
     [ "encoder1:GND", "gnd1:GND", "black", [ "h0", "v48.8", "h-144" ] ],
     [ "vcc1:VCC", "encoder1:VCC", "red", [ "v0" ] ],
-    [ "lcd1:CS", "esp:D7", "gold", [ "v0" ] ],
     [ "vcc2:VCC", "lcd1:RST", "red", [ "v0" ] ],
     [ "gnd2:GND", "lcd1:LED", "black", [ "v0" ] ],
     [ "lcd1:MOSI", "esp:D10", "white", [ "v0" ] ],
     [ "lcd1:D/C", "esp:D8", "blue", [ "v0" ] ],
-    [ "lcd1:SCK", "esp:D9", "green", [ "v0" ] ],
+    [ "lcd1:SCK", "esp:D9", "gold", [ "v0" ] ],
     [ "lcd1:GND", "gnd2:GND", "black", [ "v0" ] ],
-    [ "lcd1:VCC", "vcc2:VCC", "red", [ "v0" ] ]
+    [ "lcd1:VCC", "vcc2:VCC", "red", [ "v0" ] ],
+    [ "esp:D0", "btn4:1.r", "orange", [ "h-19.2", "v-67.2" ] ],
+    [ "btn2:1.r", "esp:D1", "orange", [ "v0", "h77", "v28.8" ] ],
+    [ "btn1:1.r", "esp:D2", "orange", [ "v0" ] ],
+    [ "encoder1:CLK", "esp:D3", "yellow", [ "h9.6", "v-48" ] ],
+    [ "encoder1:DT", "esp:D4", "cyan", [ "h19.2", "v-47.9" ] ],
+    [ "encoder1:SW", "esp:D5", "orange", [ "h28.8", "v-47.9" ] ],
+    [ "lcd1:CS", "esp:D6", "green", [ "v-19.2", "h-230.4", "v-28.8" ] ],
+    [ "esp:D7", "bz1:2", "green", [ "v0" ] ],
+    [ "gnd2:GND", "bz1:1", "black", [ "v9.6", "h-86.4", "v134.4" ] ]
   ],
   "dependencies": {}
 }
