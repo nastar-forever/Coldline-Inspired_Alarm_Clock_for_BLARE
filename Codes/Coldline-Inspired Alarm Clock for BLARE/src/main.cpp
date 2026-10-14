@@ -462,7 +462,7 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     dmiddata.effective_token = dmdata->token;
 
     dmlockscreen = DMLockscreenData {};
-    dmlockscreen.correct_digits = (*dmdata->dms)[depending_to].code;
+    dmlockscreen.correct_digits = dmdata->dms[depending_to].code;
 
     for (uint8_t i = 0; i < 3; i++) {
       dmiddata.dials[i] = DMID2DialData::random_init();
