@@ -627,7 +627,7 @@ void loop() {
 
     if (idata_dmmenu.made_selection) {
       wardata.current_operating_dmn = idata_dmmenu.current_selection;
-      flags.mode = ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection]->mid;
+      flags.mode = ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection].mid;
 
     } else if (ret.sec != last_sec) {
       dmmenu_screen_update(
