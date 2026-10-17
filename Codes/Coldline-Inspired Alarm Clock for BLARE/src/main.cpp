@@ -124,6 +124,10 @@ struct DMData {
   uint8_t token;
   uint8_t timer_left = 60; // max 60 seconds to shut down?
   uint8_t current_operating_dmn = 0;
+
+  void regenerate_token() {
+    token = random(256);
+  }
 };
 
 struct DMLockscreenData {
@@ -292,12 +296,14 @@ DMData construct_dmdata(
     packet.dms[i].mid = random(available_minigames); // 0-indexed
 
     if (i > 0 && dep_dm_count < dep_dm_limit_count && random(0, 2)) {
-      packet.dms[i].dep_to = random(i) + 1;
+      packet.dms[i].dep_to = random(i);
       dep_dm_count++;
     } else {
       packet.dms[i].dep_to = 0;
     }
   }
+
+  packet.regenerate_token();
 
   return packet;
 }
@@ -385,17 +391,24 @@ void register_inputs(InputData *idata) {
 
   idata->re_clockwise = false;
   idata->re_counterclockwise = false;
+  idata->any_sw_clicked = false;
 
   for (uint8_t i=0; i<3; i++) {
     idata->sws_clicked[i] = false;
 
     bool pressed = digitalRead(swsmap[i]) == LOW;
-    idata->sws_clicked[i] = idata->sws_clicked[i] && !pressed;
+    idata->sws_clicked[i] = idata->sws_holding[i] && !pressed;
     idata->sws_holding[i] = pressed;
+    
+    idata->any_sw_clicked = idata->any_sw_clicked || idata->sws_clicked[i];
   }
 
   // RE THINGS
   int8_t delta;
+
+  bool pressed = digitalRead(PIN_RE_CLICK) == LOW;
+  idata->re_bttn_clicked = idata->re_bttn_holding && !pressed;
+  idata->re_bttn_holding = pressed;
 
   portENTER_CRITICAL(&re_mux);
   delta = re_delta;
@@ -730,7 +743,7 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       break;
     
     
-    case P_MINIGAME:
+    case P_MINIGAME: {
       bool is_onplace[3] = {false, false, false};
       uint16_t ms_passed_s_tick = static_cast<uint16_t>((esp_timer_get_time() - dmiddata.last_tick_us) / 1000);
 
@@ -773,6 +786,7 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       }
 
       break;
+    }
     
     
     case P_CLOSING_PASS:
@@ -838,7 +852,7 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       }
       break;
     
-    case P_MINIGAME:
+    case P_MINIGAME: {
       uint16_t ms_passed_s_tick = static_cast<uint16_t>((esp_timer_get_time() - dmiddata.last_tick_us) / 1000);
 
       if (ms_passed_s_tick >= ms_per_tick) {
@@ -874,6 +888,7 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
         }
       }
       break;
+    }
     
     case P_CLOSING_PASS:
       // Fall thtough
@@ -1012,22 +1027,22 @@ void loop() {
     mdata_ring = RingmodeData {};
   }
 
-  if (flags.mode == ALARM_RINGING && (idata.sws_clicked[0] || idata.sws_clicked[1] || idata.sws_clicked[2])) {
+  if (flags.mode == ALARM_RINGING && idata.any_sw_clicked) {
     wardata = construct_dmdata();
     flags.mode = ALARM_DMMENU;
   }
 
   if (flags.mode == ALARM_DMMENU) {
-    if (idata_dmmenu.effective_token != wardata.token) {
-      idata_dmmenu = DMMenu_IIData {};
-      idata_dmmenu.effective_token = wardata.token;
-    }
+    wardata.regenerate_token();
 
     dmmenu_iinterpreter(&idata_dmmenu, &idata, wardata.token);
 
     if (idata_dmmenu.made_selection) {
       wardata.current_operating_dmn = idata_dmmenu.current_selection;
       flags.mode = ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection].mid;
+
+      // Reset dmmenu
+      idata_dmmenu = DMMenu_IIData {};
 
     } else if (t.sec != last_sec) {
       dmmenu_screen_update(
