@@ -11,6 +11,8 @@
 
 // Dev's QOL Configs
 #define TIME_ACCURACY 1000000
+#define SW_DEBOUNCE_US 25000
+#define DIAL_DEBOUNCE_US 1500
 
 // TFT pins
 #define TFT_SCLK 9
@@ -145,9 +147,11 @@ struct InputData {
   bool sws_clicked[3] = {false, false, false};
   bool sws_holding[3] = {false, false, false};
   bool any_sw_clicked = false;
-  
+
+  uint64_t sws_last_us[3] = {0,0,0};
+  uint64_t re_bttn_last_us = 0;
   // bool input_locks[4] = {false, false, false}; // Input locks are replaced by sws_holding
-  uint8_t re_a_last_dr = HIGH;
+  // uint8_t re_a_last_dr = HIGH;
 };
 
 struct DMMenu_IIData {
@@ -437,7 +441,7 @@ volatile uint64_t re_last_us = 0;
 void IRAM_ATTR re_isr() {
   uint64_t now = esp_timer_get_time();
 
-  if (now - re_last_us < 1500) return;
+  if (now - re_last_us < DIAL_DEBOUNCE_US) return;
   if (digitalRead(PIN_RE_B) == HIGH) { // PIN_RE_A aren't checked because it's the condition for the interrupt
     re_delta++;
   } else {
@@ -451,26 +455,35 @@ portMUX_TYPE re_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void register_inputs(InputData *idata) {
   const uint8_t swsmap[3] = {PIN_SW1, PIN_SW2, PIN_SW3};
+  const uint64_t now = esp_timer_get_time();
 
   idata->re_delta = 0;
   idata->any_sw_clicked = false;
 
   for (uint8_t i=0; i<3; i++) {
+    bool pressed = digitalRead(swsmap[i]) == LOW;
     idata->sws_clicked[i] = false;
 
-    bool pressed = digitalRead(swsmap[i]) == LOW;
-    idata->sws_clicked[i] = idata->sws_holding[i] && !pressed;
-    idata->sws_holding[i] = pressed;
+    if (pressed != idata->sws_holding[i] && now - idata->sws_last_us[i] >= SW_DEBOUNCE_US) {
+      idata->sws_clicked[i] = idata->sws_holding[i] && !pressed;
+      idata->sws_holding[i] = pressed;
+      idata->sws_last_us[i] = now;
+    }
     
     idata->any_sw_clicked = idata->any_sw_clicked || idata->sws_clicked[i];
   }
 
   // RE THINGS
-  int8_t delta;
+  bool re_pressed = digitalRead(PIN_RE_CLICK) == LOW;
+  idata->re_bttn_clicked = false;
 
-  bool pressed = digitalRead(PIN_RE_CLICK) == LOW;
-  idata->re_bttn_clicked = idata->re_bttn_holding && !pressed;
-  idata->re_bttn_holding = pressed;
+  if (re_pressed != idata->re_bttn_holding && now - idata->re_bttn_last_us >= SW_DEBOUNCE_US) {
+    idata->re_bttn_clicked = idata->re_bttn_holding && !re_pressed;
+    idata->re_bttn_holding = re_pressed;
+    idata->re_bttn_last_us = now;
+  }
+  
+  int8_t delta;
 
   portENTER_CRITICAL(&re_mux);
   delta = re_delta;
@@ -717,7 +730,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       break;
       
     case P_INTRO: {
-      const uint32_t us_per_blink = 8000000;
+      const uint32_t us_per_blink = 800000;
       uint64_t time_us = esp_timer_get_time();
 
       bool condition1 = time_us - dmiddata.last_blink_us >= us_per_blink;
@@ -740,25 +753,28 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
 
       if (dmiddata.blink_idx >= 6) {
         dmiddata.phase = P_MINIGAME;
+        dmiddata.last_blink_us = esp_timer_get_time();
       }
       break;
     }
     
     case P_MINIGAME: {
-      const uint32_t us_per_blink = 8000000;
+      const uint32_t us_per_blink = 800000;
       uint64_t time_us = esp_timer_get_time();
       bool condition1 = time_us - dmiddata.last_blink_us >= us_per_blink;
+      
+      
+      if (condition1 && dmiddata.blink_progression == 1) {
+        dmid1_screen_update(dmdata->timer_left, -1);
+        dmiddata.blink_progression = 0;
+        dmiddata.last_blink_us = time_us;
+      }
 
 
       for (uint8_t i = 0; i<3; i++) {
         if (idata->sws_clicked[i]) {
           dmiddata.selection_orders[dmiddata.so_idx] = i;
         }
-      }
-
-      if (condition1 && dmiddata.blink_progression == 1) {
-        dmid1_screen_update(dmdata->timer_left, -1);
-        dmiddata.blink_progression = 0;
       }
     
       
@@ -1027,6 +1043,7 @@ void dmid4_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     ultoa(self_code, digits_char, 10);
 
     dmiddata = DMID4Data::init(digits_char);
+    dmiddata.effective_token = dmdata->token;
     dmlockscreen = DMLockscreenData {};
 
     if (depending_to != D_NONE) {
@@ -1104,16 +1121,7 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
       ddata.correct_codes[i] = dmdata->dms[i].code;
     }
   }
-
-  if (second_passed) {
-    if (onfailure) {
-      failure_screen(dmdata->timer_left);
-      return;
-    }
-
-    deactivation_screen_update(dmdata->timer_left, &ddata);
-  }
-
+  
   if (idata->re_delta) {
     ddata.current_digit = cap_re_delta_change(ddata.current_digit, idata->re_delta, 10);
   }
@@ -1151,14 +1159,26 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
             }
           }
         }
-
+        
         if (pass) {
           flags->mode = M_STANDBY;
+          return;
         } else {
           onfailure = true;
           failure_screen(dmdata->timer_left);
+          return;
         }
       }
+    }
+    
+    deactivation_screen_update(dmdata->timer_left, &ddata);
+  }
+  
+
+  if (second_passed) {
+    if (onfailure) {
+      failure_screen(dmdata->timer_left);
+      return;
     }
 
     deactivation_screen_update(dmdata->timer_left, &ddata);
@@ -1195,14 +1215,14 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
   }
 
   config->configure_pointer = idx + base;
+  
+  if ((config->configure_pointer == C_ALARM_AMPM || config->configure_pointer == C_CLOCK_AMPM) && flags->use_24h) {
+    config->configure_pointer += idata->sws_clicked[I_SW_CONFIG_POINTER_INCREASE] ? 1 : -1;
+  }
 
   if (idata->any_sw_clicked) {
     NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
     config_screen_update(&t, flags, config);
-  }
-
-  if ((config->configure_pointer == C_ALARM_AMPM || config->configure_pointer == C_CLOCK_AMPM) && flags->use_24h) {
-    config->configure_pointer += idata->sws_clicked[I_SW_CONFIG_POINTER_INCREASE] ? 1 : -1;
   }
 
   if (!idata->re_delta) {
@@ -1325,7 +1345,7 @@ void loop() {
   register_inputs(&idata);
 
 
-  if (t.min == config.alarm_m && t.h24hour == config.alarm_h24 && flags.alarm_active && flags.mode < 200 && !flags.alarm_rang_this_minute) {
+  if (t.min == config.alarm_m && t.h24hour == config.alarm_h24 && flags.alarm_active && flags.mode < M_ALARM_RINGING && !flags.alarm_rang_this_minute) {
     flags.mode = M_ALARM_RINGING;
     flags.alarm_rang_this_minute = true;
     mdata_ring = RingmodeData {};
@@ -1345,6 +1365,10 @@ void loop() {
   } else if (flags.mode == M_ALARM_DMMENU) {
     dmmenu_iinterpreter(&idata_dmmenu, &idata, wardata.token);
 
+    if (idata.sws_clicked) {
+      dmmenu_screen_update(&t, flags.use_24h, wardata.timer_left, idata_dmmenu.current_selection, mdata_ring.screen_state);
+    }
+
     if (idata_dmmenu.made_selection && idata_dmmenu.current_selection) { // if current selection == 0
       wardata.current_operating_dmn = idata_dmmenu.current_selection-1;
       flags.mode = M_ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection-1].mid;
@@ -1352,6 +1376,9 @@ void loop() {
       // Reset dmmenu (again, previosuly this line isn't exists)
       idata_dmmenu = DMMenu_IIData {};
 
+    } else if (idata_dmmenu.made_selection) {
+      flags.mode = M_ALARM_DMMENU_DEACTIVATION;
+    
     } else if (t.sec != last_sec) {
       dmmenu_screen_update(
         &t,
@@ -1360,9 +1387,6 @@ void loop() {
         idata_dmmenu.current_selection,
         mdata_ring.screen_state
       );
-
-    } else if (idata_dmmenu.made_selection) {
-      flags.mode = M_ALARM_DMMENU_DEACTIVATION;
     }
 
   } else if (flags.mode == M_CONFIG) {
@@ -1420,7 +1444,7 @@ void loop() {
         flags.alarm_active
       );
   
-    } else if (flags.mode >= 210) {
+    } else if (flags.mode >= M_ALARM_DMMENU) {
       wardata.timer_left--;
   
       if (wardata.timer_left <= 0) {
