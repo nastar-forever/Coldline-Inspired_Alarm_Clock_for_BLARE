@@ -56,8 +56,9 @@
 #define C_ALARM_H 20
 #define C_ALARM_M 21
 #define C_ALARM_AMPM 22
-#define C_ALARM_TRANSIT 23
-#define C_ALARM_CLOCKMODE 24
+#define C_ALARM_TOGGLE 23
+#define C_ALARM_TRANSIT 24
+#define C_ALARM_CLOCKMODE 25
 
 // MINIGAME PHASE
 #define P_PREINTRO 0
@@ -83,6 +84,9 @@
 #define S_ACTIVE 1
 #define S_DEACTIVE -1
 
+// DEPENDING TO
+#define D_NONE 255
+
 
 // Create display entity
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK);
@@ -92,6 +96,7 @@ struct SysFlags {
   uint8_t mode = M_STANDBY;
   bool use_24h = false;
   bool alarm_active = false;
+  bool alarm_rang_this_minute = false;
 };
 
 
@@ -101,7 +106,7 @@ struct SysConfig {
   uint8_t h24h_offset = 0;
   uint8_t alarm_h24 = 0;
   uint8_t alarm_m = 0;
-  uint8_t configure_pointer = 0;
+  uint8_t configure_pointer = C_CLOCK_H;
 };
 
 struct NowReturn {
@@ -134,7 +139,7 @@ struct RingmodeData {
 };
 
 struct InputData {
-  bool re_delta = 0;
+  int8_t re_delta = 0;
   bool re_bttn_clicked = false;
   bool re_bttn_holding = false;
   bool sws_clicked[3] = {false, false, false};
@@ -159,19 +164,20 @@ struct MonoDMData {
 
 struct DMData {
   MonoDMData dms[3];
-  uint8_t token;
+  uint8_t token; // 1-byte token is far more than enough.
   uint8_t timer_left = 60; // max 60 seconds to shut down?
   uint8_t current_operating_dmn = 0;
 
   void regenerate_token() {
-    token++;
+    static uint8_t static_token = 0;
+    static_token++;
+    token = static_token;
   }
 };
 
 struct DeactivationData {
   uint8_t effective_token = 0;
   
-  int8_t status = S_HOLD;
   uint8_t code_idx = 0;
   uint8_t digit_idx = 0;
   uint8_t current_digit = 0;
@@ -222,7 +228,7 @@ struct DMID2DialData {
     ret.sensitivity = random(sensmin, sensmax + 1);
     ret.gravity = random(gravmin, min<uint8_t>(gravmax, ret.sensitivity) + 1);
     ret.wstart = random(0, 256 - rangemax);
-    ret.wend = ret.gravity + random(rangemin, rangemax + 1);
+    ret.wend = ret.wstart + random(rangemin, rangemax + 1);
     
     if (randomize_position) {
       ret.position = random(0, 256);
@@ -341,6 +347,8 @@ DMData construct_dmdata(
   uint8_t dep_dm_count = 0;
   DMData packet {};
 
+  packet.timer_left = timer;
+
   for (uint8_t i = 0; i < dm_counts; i++) {
     packet.dms[i].code = random(1000, 9999);
     packet.dms[i].mid = random(available_minigames); // 0-indexed
@@ -349,7 +357,7 @@ DMData construct_dmdata(
       packet.dms[i].dep_to = random(i);
       dep_dm_count++;
     } else {
-      packet.dms[i].dep_to = 0;
+      packet.dms[i].dep_to = D_NONE;
     }
   }
 
@@ -375,7 +383,7 @@ void buzzhandler(
     buzzingdata->direction = 1;
 
     if (write_tone) {
-      ledcWriteTone(BUZZER_CHANNEL, 0);
+      ledcWriteTone(channel, 0);
     }
     return;
   };
@@ -539,8 +547,14 @@ void deactivation_screen_update(
 ) {}
 
 
+int cap_re_delta_change(int x, int8_t delta, int n) {
+  return ((x + delta) % n + n) % n;
+}
+
+
 void lockscreen_orchestrator(DMLockscreenData *dmld, InputData *idata) {
-  dmld->current_digit = (dmld->current_digit + 10 + idata->re_delta) % 10;
+  dmld->current_digit = cap_re_delta_change(dmld->current_digit, idata->re_delta, 10);
+  // dmld->current_digit = (dmld->current_digit + 10 + idata->re_delta) % 10;
 
   if (idata->re_bttn_clicked) {
     dmld->locked_digits[dmld->digit_idx] = dmld->current_digit;
@@ -603,7 +617,7 @@ bool standard_dm_regular_update(uint8_t dmphase, uint8_t timer_left, uint16_t se
 }
 
 uint8_t standard_dm_preintro(uint8_t timer_left, uint8_t depending_to, DMLockscreenData *dmlockscreen, InputData *idata) {
-  if (depending_to != 0) {
+  if (depending_to != D_NONE) {
     lockscreen_orchestrator(dmlockscreen, idata);
 
     switch (dmlockscreen->status) {
@@ -655,7 +669,6 @@ void standard_dm_closing(SysFlags *flags, bool any_input) {
 void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, InputData *idata) {
   static DMID1Data dmiddata {};
   static DMLockscreenData dmlockscreen {};
-  static bool failure = false;
 
   uint16_t self_code = dmdata->dms[dmdata->current_operating_dmn].code;
   uint8_t depending_to = dmdata->dms[dmdata->current_operating_dmn].dep_to;
@@ -669,7 +682,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       dmiddata.orders[i] = random(0, 3); // 0-indexed
     }
 
-    if (depending_to != 0) {
+    if (depending_to != D_NONE) {
       dmlockscreen.correct_digits = dmdata->dms[depending_to].code;
     }
   }
@@ -771,7 +784,7 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     dmiddata.effective_token = dmdata->token;
     
     dmlockscreen = DMLockscreenData {};
-    if (depending_to != 0) {
+    if (depending_to != D_NONE) {
       dmlockscreen.correct_digits = dmdata->dms[depending_to].code;
     }
     
@@ -886,7 +899,7 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
 
     dmlockscreen = DMLockscreenData {};
 
-    if (depending_to != 0) {
+    if (depending_to != D_NONE) {
       dmlockscreen.correct_digits = dmdata->dms[depending_to].code;
     }
   }
@@ -922,15 +935,15 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     case P_MINIGAME: {
       uint16_t ms_passed_s_tick = static_cast<uint16_t>((esp_timer_get_time() - dmiddata.last_tick_us) / 1000);
 
+      if (idata->sws_clicked[I_SW_SELECT]) {
+        dmiddata.nodes_status[dmiddata.node_idx] = dmiddata.position >= dmiddata.wstart && dmiddata.position <= dmiddata.wend ? S_PASS : S_FAIL;
+        dmiddata.node_idx++;
+        dmiddata.position = 0;
+        dmiddata.shuffle_params();
+      }
+
       if (ms_passed_s_tick >= ms_per_tick) {
         dmiddata.position += dmiddata.acceleration;
-
-        if (idata->sws_holding[I_SW_SELECT]) {
-          dmiddata.nodes_status[dmiddata.node_idx] = dmiddata.position >= dmiddata.wstart && dmiddata.position <= dmiddata.wend;
-          dmiddata.node_idx++;
-          dmiddata.position = 0;
-          dmiddata.shuffle_params();
-        }
         
         dmid3_screen_update(dmdata->timer_left, &dmiddata);
         dmiddata.last_tick_us = esp_timer_get_time();
@@ -974,13 +987,13 @@ void dmid4_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
   uint8_t depending_to = dmdata->dms[dmdata->current_operating_dmn].dep_to;
 
   if (dmiddata.effective_token != dmdata->token) {
-    char digits_chr[4];
-    ultoa(self_code, digits_chr, 10);
+    char digits_char[5];
+    ultoa(self_code, digits_char, 10);
 
-    dmiddata = DMID4Data::init(digits_chr);
+    dmiddata = DMID4Data::init(digits_char);
     dmlockscreen = DMLockscreenData {};
 
-    if (depending_to != 0) {
+    if (depending_to != D_NONE) {
       dmlockscreen.correct_digits = dmdata->dms[depending_to].code;
     }
   }
@@ -1010,7 +1023,7 @@ void dmid4_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       dmiddata.phase = P_MINIGAME;
       break;
     
-    case P_MINIGAME:
+    case P_MINIGAME: {
       static uint64_t last_shuffle_us = 0;
       const int64_t shuffle_interval_us = 100000;
 
@@ -1025,6 +1038,9 @@ void dmid4_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       } else if (idata->sws_clicked[I_SW_SELECT]) {
         dmiddata.phase = P_SPECIAL_CASE;
       }
+
+      break;
+    }
     
     case P_SPECIAL_CASE: // Special case
       flags->mode = M_ALARM_DMMENU;
@@ -1062,7 +1078,7 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
   }
 
   if (idata->re_delta) {
-    ddata.current_digit = (ddata.current_digit + 10 + idata->re_delta) % 10;
+    ddata.current_digit = cap_re_delta_change(ddata.current_digit, idata->re_delta, 10);
   }
 
   if (onfailure) {
@@ -1092,7 +1108,7 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
           ultoa(ddata.correct_codes[ci], code_digits_str, 10);
 
           for (uint8_t di = 0; di<4; di++) {
-            if (code_digits_str[di] != '0' + ddata.locked_digits[ddata.code_idx][di]) {
+            if (code_digits_str[di] != '0' + ddata.locked_digits[ci][di]) {
               pass = false;
               break;
             }
@@ -1102,6 +1118,7 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
         if (pass) {
           flags->mode = M_STANDBY;
         } else {
+          onfailure = true;
           failure_screen(dmdata->timer_left);
         }
       }
@@ -1117,24 +1134,38 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
     return;
   }
 
-  uint8_t additor = config->configure_pointer >= C_ALARM_H ? C_CLOCK_H : C_ALARM_H;
-  uint8_t capper = additor == C_ALARM_H ? C_ALARM_CLOCKMODE : C_CLOCK_CLOCKMODE; 
-  
+  uint8_t cpntr = config->configure_pointer;
+  bool in_alarm = cpntr >= C_ALARM_H;
 
+  uint8_t base = in_alarm ? C_ALARM_H : C_CLOCK_H;
+  uint8_t last = in_alarm ? C_ALARM_CLOCKMODE : C_CLOCK_CLOCKMODE;
+  uint8_t size = last - base + 1;
+  uint8_t idx = cpntr - base;
+  // uint8_t additor = config->configure_pointer >= C_ALARM_H ? C_ALARM_H : C_CLOCK_H;
+  // uint8_t capper = additor == C_ALARM_H ? C_ALARM_CLOCKMODE : C_CLOCK_CLOCKMODE; 
+  
   if (idata->sws_clicked[I_SW_CONFIG_POINTER_INCREASE]) {
-    config->configure_pointer = (config->configure_pointer + 1) % capper + additor;
+    idx = (idx + 1) % size;
 
   } else if (idata->sws_clicked[I_SW_CONFIG_POINTER_DECREASE]) {
-    config->configure_pointer = (config->configure_pointer + capper - 1) % capper + additor;
+    idx = (idx + size - 1) % size;
 
-  } else {
+  } else if (idata->sws_clicked[I_SW_EXIT_CONFIG]) {
     flags->mode = M_STANDBY;
-    standby_screen_update(&time_now(config->s_offset, config->m_offset, config->h24h_offset), flags->use_24h, flags->alarm_active);
+    NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+    standby_screen_update(&t, flags->use_24h, flags->alarm_active);
     return;
   }
 
+  config->configure_pointer = idx;
+
+  if (idata->any_sw_clicked) {
+    NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+    config_screen_update(&t, flags);
+  }
+
   if ((config->configure_pointer == C_ALARM_AMPM || config->configure_pointer == C_CLOCK_AMPM) && flags->use_24h) {
-    config->configure_pointer++;
+    config->configure_pointer += idata->sws_clicked[I_SW_CONFIG_POINTER_INCREASE] ? 1 : -1;
   }
 
   if (!idata->re_delta) {
@@ -1143,15 +1174,15 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
 
   switch (config->configure_pointer) {
     case C_CLOCK_H:
-      config->h24h_offset = (config->h24h_offset + 24 + idata->re_delta) % 24;
+      config->h24h_offset = cap_re_delta_change(config->h24h_offset, idata->re_delta, 24);
       break;
 
     case C_CLOCK_M:
-      config->m_offset = (config->m_offset + 60 + idata->re_delta) % 60;
+      config->m_offset = cap_re_delta_change(config->m_offset, idata->re_delta, 60);
       break;
     
     case C_CLOCK_S:
-      config->s_offset = (config->s_offset + 60 + idata->re_delta) % 60;
+      config->s_offset = cap_re_delta_change(config->s_offset, idata->re_delta, 60);
       break;
     
     case C_CLOCK_AMPM:
@@ -1159,17 +1190,19 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
       break;
       
     case C_ALARM_H:
-      config->alarm_h24 = (config->alarm_h24 + 24 + idata->re_delta) % 24;
+      config->alarm_h24 = cap_re_delta_change(config->alarm_h24, idata->re_delta, 24);
       break;
 
     case C_ALARM_M:
-      config->alarm_m =(config->alarm_m + 60 + idata->re_delta) % 60;
+      config->alarm_m = cap_re_delta_change(config->alarm_m, idata->re_delta, 60);
       break;
 
     case C_ALARM_AMPM:
       config->alarm_h24 = (config->alarm_h24 + 12) % 24;
       break;
 
+    case C_ALARM_TOGGLE:
+      flags->alarm_active = !flags->alarm_active;
 
     case C_CLOCK_CLOCKMODE:
       // Fall through
@@ -1178,14 +1211,15 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
       break;
 
 
-    case C_ALARM_TRANSIT:
-      // Fall through
     case C_CLOCK_TRANSIT:
-      config->configure_pointer = config->configure_pointer < C_ALARM_H ? C_CLOCK_TRANSIT : C_ALARM_TRANSIT;
+      // Fall through
+    case C_ALARM_TRANSIT:
+      config->configure_pointer = config->configure_pointer < C_ALARM_H ? C_ALARM_TRANSIT : C_CLOCK_TRANSIT;
       break;
   }
 
-  config_screen_update(&time_now(config->s_offset, config->m_offset, config->h24h_offset), flags);
+  NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+  config_screen_update(&t, flags);
 }
 
 
@@ -1233,13 +1267,14 @@ void loop() {
   // Static var def
   static DMData wardata {};
   static SysFlags flags {};
+  static SysConfig config {};
   static RingmodeData mdata_ring {}; // mdata = mode data
   
   static InputData idata {};
   static DMMenu_IIData idata_dmmenu {};
 
-  static SysConfig config {};
   static uint8_t last_sec = 0;
+  static uint8_t last_min = 0;
 
 
   // UPDATES
@@ -1252,8 +1287,9 @@ void loop() {
   register_inputs(&idata);
 
 
-  if (t.min == config.alarm_m && t.h24hour == config.alarm_h24 && flags.alarm_active && flags.mode < 200) {
+  if (t.min == config.alarm_m && t.h24hour == config.alarm_h24 && flags.alarm_active && flags.mode < 200 && !flags.alarm_rang_this_minute) {
     flags.mode = M_ALARM_RINGING;
+    flags.alarm_rang_this_minute = true;
     mdata_ring = RingmodeData {};
   }
 
@@ -1294,6 +1330,10 @@ void loop() {
 
   } else if (flags.mode == M_ALARM_DMMENU_DEACTIVATION) {
     deactivation_orchestrator(t.sec != last_sec, &flags, &wardata, &idata);
+
+    if (flags.mode == M_ALARM_DMMENU) {
+      wardata.regenerate_token();
+    }
   }
   
   
@@ -1318,8 +1358,16 @@ void loop() {
         wardata.regenerate_token();
       }
     }
+  } else if (mdata_ring.buzzer_state == S_ACTIVE) {
+    mdata_ring.deactivate();
+    buzzhandler(&mdata_ring);
   }
   
+
+  if (t.min != last_min) {
+    flags.alarm_rang_this_minute = false;
+    last_min = t.min;
+  }
   
   if (t.sec != last_sec) {
     last_sec = t.sec;
