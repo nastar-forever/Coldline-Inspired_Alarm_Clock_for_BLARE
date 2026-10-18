@@ -85,6 +85,8 @@
 #define S_FAIL -1
 #define S_ACTIVE 1
 #define S_DEACTIVE -1
+#define S_BLINK_HOLD -1
+#define S_BLINK_OFF -2
 
 // DEPENDING TO
 #define D_NONE 255
@@ -104,8 +106,6 @@ struct SysFlags {
 
 struct SysConfig {
   uint8_t s_offset = 0;
-  uint8_t m_offset = 0;
-  uint8_t h24h_offset = 0;
   uint8_t alarm_h24 = 0;
   uint8_t alarm_m = 0;
   uint8_t configure_pointer = C_CLOCK_H;
@@ -411,14 +411,11 @@ void buzzhandler(
 }
 
 NowReturn time_now(
-  uint8_t s_offset,
-  uint8_t m_offset,
-  uint8_t h24h_offset
+  uint8_t s_offset
 ) {
   int64_t now = esp_timer_get_time();
-  int64_t total_sec = now / TIME_ACCURACY;
-  total_sec += s_offset + m_offset*60 + h24h_offset*3600;
-  total_sec %= 86400; // 3600*24
+  int64_t total_sec = now / TIME_ACCURACY + s_offset;
+  total_sec = ((total_sec % 86400) + 86400) % 86400; // 60 * 60 * 24
 
   NowReturn ret;
   ret.sec = total_sec % 60;
@@ -541,7 +538,7 @@ void success_screen (
 
 void dmid1_screen_update(
   uint8_t timer_left,
-  int8_t swid_to_blink = -1 // 0-indexed
+  int8_t swid_to_blink = S_BLINK_HOLD // 0-indexed
 ) {}
 
 void dmid2_screen_update(
@@ -709,7 +706,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
   
   if (second_passed) {
     if (standard_dm_regular_update(dmiddata.phase, dmdata->timer_left, self_code)) {
-      dmid1_screen_update(dmdata->timer_left, -1);
+      dmid1_screen_update(dmdata->timer_left, S_BLINK_HOLD);
     }
   }
 
@@ -718,7 +715,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       switch (standard_dm_preintro(dmdata->timer_left, depending_to, &dmlockscreen, idata)) {
         case S_PASS:
           dmiddata.phase = P_INTRO;
-          dmid1_screen_update(dmdata->timer_left, -1);
+          dmid1_screen_update(dmdata->timer_left, S_BLINK_HOLD);
           dmiddata.last_blink_us = esp_timer_get_time();
           break;
         
@@ -742,13 +739,14 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
         dmiddata.last_blink_us = time_us;
 
       } else if (condition1 && dmiddata.blink_progression == 1) {
-        dmid1_screen_update(dmdata->timer_left, -1);
+        dmid1_screen_update(dmdata->timer_left, S_BLINK_OFF);
         dmiddata.blink_progression = 2;
         dmiddata.last_blink_us = time_us;
   
       } else if (condition1 && dmiddata.blink_progression == 2) {
         dmiddata.blink_progression = 0;
         dmiddata.blink_idx++;
+        dmiddata.last_blink_us = time_us;
       }
 
       if (dmiddata.blink_idx >= 6) {
@@ -765,9 +763,8 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       
       
       if (condition1 && dmiddata.blink_progression == 1) {
-        dmid1_screen_update(dmdata->timer_left, -1);
+        dmid1_screen_update(dmdata->timer_left, S_BLINK_OFF);
         dmiddata.blink_progression = 0;
-        dmiddata.last_blink_us = time_us;
       }
 
 
@@ -780,6 +777,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       
       if (idata->any_sw_clicked) {
         dmiddata.blink_progression = 1;
+        dmiddata.last_blink_us = time_us;
 
         dmid1_screen_update(dmdata->timer_left, dmiddata.selection_orders[dmiddata.so_idx]);
         
@@ -1124,6 +1122,7 @@ void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmda
   
   if (idata->re_delta) {
     ddata.current_digit = cap_re_delta_change(ddata.current_digit, idata->re_delta, 10);
+    deactivation_screen_update(dmdata->timer_left, &ddata);
   }
 
   if (onfailure) {
@@ -1209,7 +1208,7 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
 
   } else if (idata->sws_clicked[I_SW_EXIT_CONFIG]) {
     flags->mode = M_STANDBY;
-    NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+    NowReturn t = time_now(config->s_offset);
     standby_screen_update(&t, flags->use_24h, flags->alarm_active);
     return;
   }
@@ -1221,7 +1220,7 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
   }
 
   if (idata->any_sw_clicked) {
-    NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+    NowReturn t = time_now(config->s_offset);
     config_screen_update(&t, flags, config);
   }
 
@@ -1231,19 +1230,24 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
 
   switch (config->configure_pointer) {
     case C_CLOCK_H:
-      config->h24h_offset = cap_re_delta_change(config->h24h_offset, idata->re_delta, 24);
+      // config->h24h_offset = cap_re_delta_change(config->h24h_offset, idata->re_delta, 24);
+      config->s_offset += idata->re_delta * 60*60;
       break;
 
     case C_CLOCK_M:
-      config->m_offset = cap_re_delta_change(config->m_offset, idata->re_delta, 60);
+      NowReturn t = time_now(config->s_offset);
+      int16_t new_min = cap_re_delta_change(t.min, idata->re_delta, 60);
+      config->s_offset += (new_min - t.min) * 60;
       break;
     
     case C_CLOCK_S:
-      config->s_offset = cap_re_delta_change(config->s_offset, idata->re_delta, 60);
+      NowReturn n = time_now(config->s_offset);
+      int16_t new_sec = cap_re_delta_change(n.sec, idata->re_delta, 60);
+      config->s_offset += (new_sec - n.sec);
       break;
     
     case C_CLOCK_AMPM:
-      config->h24h_offset = (config->h24h_offset + 12) % 24;
+      config->s_offset += 60*60*12;
       break;
       
     case C_ALARM_H:
@@ -1276,7 +1280,7 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
       break;
   }
 
-  NowReturn t = time_now(config->s_offset, config->m_offset, config->h24h_offset);
+  NowReturn t = time_now(config->s_offset);
   config_screen_update(&t, flags, config);
 }
 
@@ -1337,9 +1341,7 @@ void loop() {
 
   // UPDATES
   NowReturn t = time_now(
-    config.s_offset,
-    config.m_offset,
-    config.h24h_offset
+    config.s_offset
   );
   
   register_inputs(&idata);
@@ -1360,12 +1362,13 @@ void loop() {
   } else if (flags.mode == M_ALARM_RINGING && idata.any_sw_clicked) {
     wardata = construct_dmdata();
     flags.mode = M_ALARM_DMMENU;
+    dmmenu_screen_update(&t, flags.use_24h, wardata.timer_left, idata_dmmenu.current_selection, mdata_ring.screen_state);
 
 
   } else if (flags.mode == M_ALARM_DMMENU) {
     dmmenu_iinterpreter(&idata_dmmenu, &idata, wardata.token);
 
-    if (idata.sws_clicked) {
+    if (idata.any_sw_clicked) {
       dmmenu_screen_update(&t, flags.use_24h, wardata.timer_left, idata_dmmenu.current_selection, mdata_ring.screen_state);
     }
 
