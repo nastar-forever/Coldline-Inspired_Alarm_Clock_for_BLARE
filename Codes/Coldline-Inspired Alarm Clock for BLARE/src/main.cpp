@@ -1,9 +1,9 @@
 #include <Arduino.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 #include <SPI.h>
-#include "time.h"
-#include "esp_timer.h"
+#include <time.h>
+#include <esp_timer.h>
+#include "Adafruit_GFX.h"
+#include "Adafruit_ST7789.h"
 
 // Fonts
 #include "Fonts/FreeMono12pt7b.h"
@@ -36,48 +36,75 @@
 // Status prefix + current space + space variation
 // Status prefix 1 = idle; 2 = ringing/'war'
 // Current space 0 = standard; 1 = config; 2 = peskyspace (minigame)
-#define STANDARD 100
-#define CONFIG_CLOCK 110
-#define CONFIG_ALARM 111
-#define ALARM_RINGING 200
-#define ALARM_DMMENU 210
-#define ALARM_DMID1 221
-#define ALARM_DMID2 222
-#define ALARM_DMID3 223
-#define ALARM_DMID4 224
+#define M_STANDBY 100
+#define M_CONFIG 110
+#define M_ALARM_RINGING 200
+#define M_ALARM_DMMENU 210
+#define M_ALARM_DMMENU_DEACTIVATION 211
+#define M_ALARM_DMID1 221
+#define M_ALARM_DMID2 222
+#define M_ALARM_DMID3 223
+#define M_ALARM_DMID4 224
+
+// CONFIG POINTERS
+#define C_CLOCK_H 10
+#define C_CLOCK_M 11
+#define C_CLOCK_S 12
+#define C_CLOCK_AMPM 13
+#define C_CLOCK_TRANSIT 14
+#define C_CLOCK_CLOCKMODE 15
+#define C_ALARM_H 20
+#define C_ALARM_M 21
+#define C_ALARM_AMPM 22
+#define C_ALARM_TRANSIT 23
+#define C_ALARM_CLOCKMODE 24
 
 // MINIGAME PHASE
 #define P_PREINTRO 0
 #define P_INTRO 1
 #define P_MINIGAME 2
-#define P_CLOSING_PASS 3
-#define P_CLOSING_FAIL 255
+#define P_CLOSING_PASS 253
+#define P_CLOSING_FAIL 254
+#define P_SPECIAL_CASE 255
 
-// STANDARD STATUS
+// INPUT MAPS
+#define I_SW_MOVE_UP 0
+#define I_SW_SELECT 1
+#define I_SW_MOVE_DOWN 2
+#define I_SW_OPEN_CONFIG 1
+#define I_SW_EXIT_CONFIG 1
+#define I_SW_CONFIG_POINTER_INCREASE 0
+#define I_SW_CONFIG_POINTER_DECREASE 2
+
+// STATUS TEMPLATE
 #define S_HOLD 0
 #define S_PASS 1
-#define S_FAIL 2
+#define S_FAIL -1
+#define S_ACTIVE 1
+#define S_DEACTIVE -1
+
 
 // Create display entity
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK);
 
 // Datacontainers
 struct SysFlags {
-  uint8_t mode = STANDARD;
+  uint8_t mode = M_STANDBY;
   bool use_24h = false;
   bool alarm_active = false;
 };
 
 
 struct SysConfig {
-  uint8_t s_offset;
-  uint8_t m_offset;
-  uint8_t h_offset;
-  uint8_t alarm_h24;
-  uint8_t alarm_m;
+  uint8_t s_offset = 0;
+  uint8_t m_offset = 0;
+  uint8_t h24h_offset = 0;
+  uint8_t alarm_h24 = 0;
+  uint8_t alarm_m = 0;
+  uint8_t configure_pointer = 0;
 };
 
-struct TimestepReturn {
+struct NowReturn {
   uint8_t sec;
   uint8_t min;
   uint8_t hour;
@@ -88,15 +115,26 @@ struct TimestepReturn {
 struct RingmodeData {
   uint8_t screen_state : 4 = 0;
   uint8_t direction : 3 = 1; // 1 = ascending, 0 = descending
-  int8_t buzzer_state : 4 = -1; // 1 = active; -1 = deactivate
+  int8_t buzzer_state : 4 = S_DEACTIVE; // 1 = active; -1 = deactivate
   int16_t current_freq : 13 = BUZZER_MIN_FREQ;
 
   uint64_t last_delta_us = 0;
+
+  void activate() {
+    buzzer_state = S_ACTIVE;
+  }
+
+  void deactivate() {
+    buzzer_state = S_DEACTIVE;
+  }
+
+  void toggle() {
+    buzzer_state = buzzer_state * -1;
+  }
 };
 
 struct InputData {
-  bool re_clockwise = false;
-  bool re_counterclockwise = false;
+  bool re_delta = 0;
   bool re_bttn_clicked = false;
   bool re_bttn_holding = false;
   bool sws_clicked[3] = {false, false, false};
@@ -126,12 +164,24 @@ struct DMData {
   uint8_t current_operating_dmn = 0;
 
   void regenerate_token() {
-    token = random(256);
+    token++;
   }
 };
 
+struct DeactivationData {
+  uint8_t effective_token = 0;
+  
+  int8_t status = S_HOLD;
+  uint8_t code_idx = 0;
+  uint8_t digit_idx = 0;
+  uint8_t current_digit = 0;
+
+  uint8_t locked_digits[3][4];
+  uint16_t correct_codes[3];
+};
+
 struct DMLockscreenData {
-  int8_t status = 0; // 0 = hold, 1 = passed, -1 = failed
+  int8_t status = S_HOLD; // 0 = hold, 1 = passed
   uint8_t digit_idx = 0;
   uint8_t current_digit = 0;
   uint8_t locked_digits[4] = {0,0,0,0};
@@ -169,11 +219,11 @@ struct DMID2DialData {
     uint8_t gravmax = 6
   ) {
     DMID2DialData ret {};
-    ret.gravity = random(0, 256 - rangemax);
-    ret.wend = ret.gravity + random(rangemin, rangemax + 1);
     ret.sensitivity = random(sensmin, sensmax + 1);
     ret.gravity = random(gravmin, min<uint8_t>(gravmax, ret.sensitivity) + 1);
-
+    ret.wstart = random(0, 256 - rangemax);
+    ret.wend = ret.gravity + random(rangemin, rangemax + 1);
+    
     if (randomize_position) {
       ret.position = random(0, 256);
     }
@@ -188,7 +238,7 @@ struct DMID2Data {
   uint8_t effective_token;
 
   int64_t last_tick_us = -1;
-  uint16_t sync_timer_left = 5000;
+  int16_t sync_timer_left = 5000;
 };
 
 
@@ -303,7 +353,7 @@ DMData construct_dmdata(
     }
   }
 
-  packet.regenerate_token();
+  packet.regenerate_token(); // Previously, this line isn't exist, lol.
 
   return packet;
 }
@@ -320,7 +370,7 @@ void buzzhandler(
 ) {
   const int8_t deltamap[2] = {negative_delta, positive_delta};
 
-  if (buzzingdata->buzzer_state == -1) {
+  if (buzzingdata->buzzer_state == S_DEACTIVE) {
     buzzingdata->current_freq = minfreq;
     buzzingdata->direction = 1;
 
@@ -345,17 +395,17 @@ void buzzhandler(
   }
 }
 
-TimestepReturn step_time_now(
+NowReturn time_now(
   uint8_t s_offset,
   uint8_t m_offset,
-  uint8_t h_offset
+  uint8_t h24h_offset
 ) {
   int64_t now = esp_timer_get_time();
   int64_t total_sec = now / TIME_ACCURACY;
-  total_sec += s_offset + m_offset*60 + h_offset*3600;
+  total_sec += s_offset + m_offset*60 + h24h_offset*3600;
   total_sec %= 86400; // 3600*24
 
-  TimestepReturn ret;
+  NowReturn ret;
   ret.sec = total_sec % 60;
   ret.min = (total_sec / 60) % 60;
   ret.h24hour = (total_sec / 3600) % 24;
@@ -389,8 +439,7 @@ portMUX_TYPE re_mux = portMUX_INITIALIZER_UNLOCKED;
 void register_inputs(InputData *idata) {
   const uint8_t swsmap[3] = {PIN_SW1, PIN_SW2, PIN_SW3};
 
-  idata->re_clockwise = false;
-  idata->re_counterclockwise = false;
+  idata->re_delta = 0;
   idata->any_sw_clicked = false;
 
   for (uint8_t i=0; i<3; i++) {
@@ -415,11 +464,7 @@ void register_inputs(InputData *idata) {
   re_delta = 0;
   portEXIT_CRITICAL(&re_mux);
 
-  if (delta > 0) {
-    idata->re_clockwise = true;
-  } else if (delta < 0) {
-    idata->re_counterclockwise = true;
-  }
+  idata->re_delta = delta;
 }
 
 
@@ -429,25 +474,27 @@ void dmmenu_iinterpreter(DMMenu_IIData *idata_dmmenu, InputData *idata, uint8_t 
     idata_dmmenu->effective_token = token;
   }
 
-  if (idata->sws_clicked[0]) {
+  dmcounts++; // ACCOUNTS FOR "DEACTIVATE OPTION"
+
+  if (idata->sws_clicked[I_SW_MOVE_UP]) {
     idata_dmmenu->current_selection = (idata_dmmenu->current_selection + dmcounts - 1) % dmcounts;
-  } else if (idata->sws_clicked[2]) {
+  } else if (idata->sws_clicked[I_SW_MOVE_DOWN]) {
     idata_dmmenu->current_selection = (idata_dmmenu->current_selection + 1) % dmcounts;
-  } else if (idata->sws_clicked[1]) {
+  } else if (idata->sws_clicked[I_SW_SELECT]) {
     idata_dmmenu->made_selection = true;
   }
 }
 
 
 // Screen updates
-void standard_screen_update(
-  TimestepReturn *time,
+void standby_screen_update(
+  NowReturn *time,
   bool use_24h,
   bool alarm_active
 ) {}
 
 void dmmenu_screen_update(
-  TimestepReturn *time,
+  NowReturn *time,
   bool use24h,
   uint8_t timer_left,
   uint8_t current_selection,
@@ -486,10 +533,14 @@ void dmid4_screen_update(
   char (*page)[10][10]
 ) {}
 
+void deactivation_screen_update(
+  uint8_t timer_left,
+  DeactivationData *ddata
+) {}
 
-void lockscreen(DMLockscreenData *dmld, InputData *idata) {
-  dmld->current_digit = (dmld->current_digit + idata->re_clockwise) % 10;
-  dmld->current_digit = (dmld->current_digit + 10 - idata->re_counterclockwise) % 10;
+
+void lockscreen_orchestrator(DMLockscreenData *dmld, InputData *idata) {
+  dmld->current_digit = (dmld->current_digit + 10 + idata->re_delta) % 10;
 
   if (idata->re_bttn_clicked) {
     dmld->locked_digits[dmld->digit_idx] = dmld->current_digit;
@@ -498,14 +549,14 @@ void lockscreen(DMLockscreenData *dmld, InputData *idata) {
   }
 
   if (dmld->digit_idx >= 3) {
-    char digits_str[4];
-    int8_t new_status = 1;
+    char digits_str[5];
+    int8_t new_status = S_PASS;
 
     ultoa(dmld->correct_digits, digits_str, 10);
 
-    for (uint8_t i=0; i<3; i++) {
-      if (dmld->locked_digits[i] != digits_str[i]) {
-        new_status = -1;
+    for (uint8_t i=0; i<4; i++) {
+      if ('0' + dmld->locked_digits[i] != digits_str[i]) {
+        new_status = S_FAIL;
         break;
       }
     }
@@ -520,14 +571,24 @@ void lockscreen(DMLockscreenData *dmld, InputData *idata) {
 
 
 void ringing_screen_update(
-  TimestepReturn *time,
+  NowReturn *time,
   bool use24h,
   uint8_t state
 ) {
 }
 
 
+void config_screen_update(
+  NowReturn *t,
+  SysFlags *flags
+) {}
+
+
 bool standard_dm_regular_update(uint8_t dmphase, uint8_t timer_left, uint16_t self_code) {
+  if (dmphase < P_INTRO) {
+    return false;
+  }
+
   if (dmphase == P_CLOSING_PASS) {
     success_screen(timer_left, self_code);
     return false;
@@ -543,7 +604,7 @@ bool standard_dm_regular_update(uint8_t dmphase, uint8_t timer_left, uint16_t se
 
 uint8_t standard_dm_preintro(uint8_t timer_left, uint8_t depending_to, DMLockscreenData *dmlockscreen, InputData *idata) {
   if (depending_to != 0) {
-    lockscreen(dmlockscreen, idata);
+    lockscreen_orchestrator(dmlockscreen, idata);
 
     switch (dmlockscreen->status) {
       case S_PASS:
@@ -585,7 +646,7 @@ bool standard_dm_intro(uint8_t token, bool sec_passed) {
 
 void standard_dm_closing(SysFlags *flags, bool any_input) {
   if (any_input) {
-    flags->mode = ALARM_DMMENU;
+    flags->mode = M_ALARM_DMMENU;
   }
 }
 
@@ -604,7 +665,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     dmiddata.effective_token = dmdata->token;
     dmlockscreen = DMLockscreenData {};
     
-    for (uint8_t i = 0; i<5; i++) {
+    for (uint8_t i = 0; i<6; i++) {
       dmiddata.orders[i] = random(0, 3); // 0-indexed
     }
 
@@ -639,7 +700,7 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
     case 1:
       delay(500);
       
-      dmid1_screen_update(dmdata->timer_left, dmiddata.blink_idx);
+      dmid1_screen_update(dmdata->timer_left, dmiddata.orders[dmiddata.blink_idx]);
       dmiddata.blink_idx++;
 
       if (dmiddata.blink_idx >= 6) {
@@ -658,13 +719,19 @@ void dmid1_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       if (idata->any_sw_clicked) {
         dmid1_screen_update(dmdata->timer_left, dmiddata.orders[dmiddata.so_idx]);
         
+        bool failed = false;
         for (uint8_t i = 0; i <= dmiddata.so_idx; i++) {
           if (dmiddata.orders[i] != dmiddata.selection_orders[i]) {
-            // FAILURE CONDITION
-            failure_screen(dmdata->timer_left);
-            flags->mode = ALARM_DMMENU;
-            delay(1000);
+            failed = true;
+            break;
           }
+        }
+
+        if (failed) {
+          failure_screen(dmdata->timer_left);
+          flags->mode = M_ALARM_DMMENU;
+          delay(1000);
+          break;
         }
 
         dmiddata.so_idx++;
@@ -770,10 +837,10 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
 
       if (ms_passed_s_tick >= ms_per_tick) {
         // SINGLE TICK
-        if (is_onplace[0] && is_onplace[1] && is_onplace[3]) {
+        if (is_onplace[0] && is_onplace[1] && is_onplace[2]) {
           dmiddata.sync_timer_left -= ms_passed_s_tick;
         
-        } else if (dmiddata.sync_timer_left >= 15000) {
+        } else if (dmiddata.sync_timer_left <= max_sync_timer) {
           dmiddata.sync_timer_left += ms_passed_s_tick;
         }
 
@@ -794,7 +861,7 @@ void dmid2_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
 
     case P_CLOSING_FAIL:
       if (idata->any_sw_clicked) {
-          flags->mode = ALARM_DMMENU;
+          flags->mode = M_ALARM_DMMENU;
         }
       break;
   }
@@ -858,7 +925,7 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       if (ms_passed_s_tick >= ms_per_tick) {
         dmiddata.position += dmiddata.acceleration;
 
-        if (idata->any_sw_clicked) {
+        if (idata->sws_holding[I_SW_SELECT]) {
           dmiddata.nodes_status[dmiddata.node_idx] = dmiddata.position >= dmiddata.wstart && dmiddata.position <= dmiddata.wend;
           dmiddata.node_idx++;
           dmiddata.position = 0;
@@ -869,7 +936,7 @@ void dmid3_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
         dmiddata.last_tick_us = esp_timer_get_time();
       }
 
-      if (dmiddata.node_idx >= 2) {
+      if (dmiddata.node_idx >= 3) {
         bool is_success = true;
 
         for (uint8_t i = 0; i<3; i++) {
@@ -944,19 +1011,181 @@ void dmid4_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, Inp
       break;
     
     case P_MINIGAME:
-      if (idata->sws_holding[0] || idata->sws_holding[1]) {
-        dmiddata.shuffle_page();
-        dmid4_screen_update(dmdata->timer_left, &(dmiddata.page));
+      static uint64_t last_shuffle_us = 0;
+      const int64_t shuffle_interval_us = 100000;
 
-      } else if (idata->sws_clicked[2]) {
-        dmiddata.phase = 254;
+      if (idata->sws_holding[I_SW_MOVE_DOWN]) {
+        uint64_t now = esp_timer_get_time();
+
+        if (now - last_shuffle_us >= shuffle_interval_us) {
+          last_shuffle_us = now;
+          dmiddata.shuffle_page();
+          dmid4_screen_update(dmdata->timer_left, &(dmiddata.page));
+        }
+      } else if (idata->sws_clicked[I_SW_SELECT]) {
+        dmiddata.phase = P_SPECIAL_CASE;
       }
+    
+    case P_SPECIAL_CASE: // Special case
+      flags->mode = M_ALARM_DMMENU;
+      break;
+
+    case P_CLOSING_PASS:
+      // Nothing
+    
+    case P_CLOSING_FAIL:
+      standard_dm_closing(flags, idata->any_sw_clicked);
+  }
+}
+
+
+void deactivation_orchestrator(bool second_passed, SysFlags *flags, DMData *dmdata, InputData *idata) {
+  static DeactivationData ddata {};
+  static bool onfailure = false;
+
+  if (ddata.effective_token != dmdata->token) {
+    ddata = DeactivationData {};
+    onfailure = false;
+
+    for (uint8_t i = 0; i<3; i++) {
+      ddata.correct_codes[i] = dmdata->dms[i].code;
+    }
+  }
+
+  if (second_passed) {
+    if (onfailure) {
+      failure_screen(dmdata->timer_left);
+      return;
+    }
+
+    deactivation_screen_update(dmdata->timer_left, &ddata);
+  }
+
+  if (idata->re_delta) {
+    ddata.current_digit = (ddata.current_digit + 10 + idata->re_delta) % 10;
+  }
+
+  if (onfailure) {
+    if (idata->any_sw_clicked) {
+      flags->mode = M_ALARM_DMMENU;
+    }
+
+    return;
+  }
+
+  if (idata->re_bttn_clicked) {
+    ddata.locked_digits[ddata.code_idx][ddata.digit_idx] = ddata.current_digit;
+    ddata.current_digit = 0;
+    ddata.digit_idx++;
+
+    if (ddata.digit_idx >= 3) {
+      ddata.digit_idx = 0;
+      ddata.code_idx++;
+
+      if (ddata.code_idx >= 3) {
+        bool pass = true;
+
+        for (uint8_t ci = 0; ci<3; ci++) {
+          if (!pass) break;
+
+          char code_digits_str[5];
+          ultoa(ddata.correct_codes[ci], code_digits_str, 10);
+
+          for (uint8_t di = 0; di<4; di++) {
+            if (code_digits_str[di] != '0' + ddata.locked_digits[ddata.code_idx][di]) {
+              pass = false;
+              break;
+            }
+          }
+        }
+
+        if (pass) {
+          flags->mode = M_STANDBY;
+        } else {
+          failure_screen(dmdata->timer_left);
+        }
+      }
+    }
+
+    deactivation_screen_update(dmdata->timer_left, &ddata);
+  }
+}
+
+
+void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
+  if (!idata->any_sw_clicked && !idata->re_delta) {
+    return;
+  }
+
+  uint8_t additor = config->configure_pointer >= C_ALARM_H ? C_CLOCK_H : C_ALARM_H;
+  uint8_t capper = additor == C_ALARM_H ? C_ALARM_CLOCKMODE : C_CLOCK_CLOCKMODE; 
+  
+
+  if (idata->sws_clicked[I_SW_CONFIG_POINTER_INCREASE]) {
+    config->configure_pointer = (config->configure_pointer + 1) % capper + additor;
+
+  } else if (idata->sws_clicked[I_SW_CONFIG_POINTER_DECREASE]) {
+    config->configure_pointer = (config->configure_pointer + capper - 1) % capper + additor;
+
+  } else {
+    flags->mode = M_STANDBY;
+    standby_screen_update(&time_now(config->s_offset, config->m_offset, config->h24h_offset), flags->use_24h, flags->alarm_active);
+    return;
+  }
+
+  if ((config->configure_pointer == C_ALARM_AMPM || config->configure_pointer == C_CLOCK_AMPM) && flags->use_24h) {
+    config->configure_pointer++;
+  }
+
+  if (!idata->re_delta) {
+    return;
+  }
+
+  switch (config->configure_pointer) {
+    case C_CLOCK_H:
+      config->h24h_offset = (config->h24h_offset + 24 + idata->re_delta) % 24;
+      break;
+
+    case C_CLOCK_M:
+      config->m_offset = (config->m_offset + 60 + idata->re_delta) % 60;
       break;
     
-    case 254: // Special case
-      flags->mode = ALARM_DMMENU;
+    case C_CLOCK_S:
+      config->s_offset = (config->s_offset + 60 + idata->re_delta) % 60;
+      break;
+    
+    case C_CLOCK_AMPM:
+      config->h24h_offset = (config->h24h_offset + 12) % 24;
+      break;
+      
+    case C_ALARM_H:
+      config->alarm_h24 = (config->alarm_h24 + 24 + idata->re_delta) % 24;
+      break;
+
+    case C_ALARM_M:
+      config->alarm_m =(config->alarm_m + 60 + idata->re_delta) % 60;
+      break;
+
+    case C_ALARM_AMPM:
+      config->alarm_h24 = (config->alarm_h24 + 12) % 24;
+      break;
+
+
+    case C_CLOCK_CLOCKMODE:
+      // Fall through
+    case C_ALARM_CLOCKMODE:
+      flags->use_24h = !flags->use_24h;
+      break;
+
+
+    case C_ALARM_TRANSIT:
+      // Fall through
+    case C_CLOCK_TRANSIT:
+      config->configure_pointer = config->configure_pointer < C_ALARM_H ? C_CLOCK_TRANSIT : C_ALARM_TRANSIT;
       break;
   }
+
+  config_screen_update(&time_now(config->s_offset, config->m_offset, config->h24h_offset), flags);
 }
 
 
@@ -1002,46 +1231,50 @@ void setup() {
 
 void loop() {
   // Static var def
-  static DMData wardata;
-  static SysFlags flags;
-  static RingmodeData mdata_ring; // mdata = mode data
+  static DMData wardata {};
+  static SysFlags flags {};
+  static RingmodeData mdata_ring {}; // mdata = mode data
   
-  static InputData idata;
-  static DMMenu_IIData idata_dmmenu; 
+  static InputData idata {};
+  static DMMenu_IIData idata_dmmenu {};
 
-  static SysConfig config {0, 0, 0, 0, 0};
+  static SysConfig config {};
   static uint8_t last_sec = 0;
 
 
   // UPDATES
-  TimestepReturn t = step_time_now(
+  NowReturn t = time_now(
     config.s_offset,
     config.m_offset,
-    config.h_offset
+    config.h24h_offset
   );
   
   register_inputs(&idata);
-  
+
+
   if (t.min == config.alarm_m && t.h24hour == config.alarm_h24 && flags.alarm_active && flags.mode < 200) {
-    flags.mode = ALARM_RINGING;
+    flags.mode = M_ALARM_RINGING;
     mdata_ring = RingmodeData {};
   }
 
-  if (flags.mode == ALARM_RINGING && idata.any_sw_clicked) {
+
+  if (flags.mode == M_STANDBY && idata.sws_clicked[I_SW_OPEN_CONFIG]) {
+    flags.mode = M_CONFIG;
+
+
+  } else if (flags.mode == M_ALARM_RINGING && idata.any_sw_clicked) {
     wardata = construct_dmdata();
-    flags.mode = ALARM_DMMENU;
-  }
+    flags.mode = M_ALARM_DMMENU;
 
-  if (flags.mode == ALARM_DMMENU) {
-    wardata.regenerate_token();
 
+  } else if (flags.mode == M_ALARM_DMMENU) {
     dmmenu_iinterpreter(&idata_dmmenu, &idata, wardata.token);
 
-    if (idata_dmmenu.made_selection) {
+    if (idata_dmmenu.made_selection && idata_dmmenu.current_selection) { // if current selection == 0
       wardata.current_operating_dmn = idata_dmmenu.current_selection;
-      flags.mode = ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection].mid;
+      flags.mode = M_ALARM_DMID1 + wardata.dms[idata_dmmenu.current_selection].mid;
 
-      // Reset dmmenu
+      // Reset dmmenu (again, previosuly this line isn't exists)
       idata_dmmenu = DMMenu_IIData {};
 
     } else if (t.sec != last_sec) {
@@ -1052,33 +1285,21 @@ void loop() {
         idata_dmmenu.current_selection,
         mdata_ring.screen_state
       );
+    } else if (idata_dmmenu.made_selection) {
+      flags.mode = M_ALARM_DMMENU_DEACTIVATION;
     }
+
+  } else if (flags.mode == M_CONFIG) {
+    config_orchestrator(&config, &flags, &idata);
+
+  } else if (flags.mode == M_ALARM_DMMENU_DEACTIVATION) {
+    deactivation_orchestrator(t.sec != last_sec, &flags, &wardata, &idata);
   }
+  
+  
+  if (flags.mode >= M_ALARM_RINGING) { // Status prefix 2 = war mode
+    mdata_ring.activate();
 
-
-  if (t.sec != last_sec) {
-    last_sec = t.sec;
-
-    if (flags.mode == STANDARD) {
-      standard_screen_update(
-        &t,
-        flags.use_24h,
-        flags.alarm_active
-      );
-
-    
-    } else if (flags.mode >= 210) {
-      wardata.timer_left--;
-
-      if (wardata.timer_left <= 0) {
-        wardata = DMData {};
-        flags.mode = ALARM_RINGING;
-      }
-    }
-  }
-
-
-  if (flags.mode >= 200) { // Status prefix 2 = war mode
     buzzhandler(&mdata_ring);
 
     if (t.sec != last_sec) {
@@ -1090,8 +1311,35 @@ void loop() {
       );
     }
 
-    if (flags.mode >= ALARM_DMID1) {
-      dmo_map[flags.mode - ALARM_DMID1](t.sec != last_sec, &flags, &wardata, &idata);
+    if (flags.mode >= M_ALARM_DMID1) {
+      dmo_map[flags.mode - M_ALARM_DMID1](t.sec != last_sec, &flags, &wardata, &idata);
+
+      if (flags.mode == M_ALARM_DMMENU) { // Failure/success is marked by returning to DMMENU after DM turn
+        wardata.regenerate_token();
+      }
     }
+  }
+  
+  
+  if (t.sec != last_sec) {
+    last_sec = t.sec;
+  
+    if (flags.mode == M_STANDBY) {
+      standby_screen_update(
+        &t,
+        flags.use_24h,
+        flags.alarm_active
+      );
+  
+    } else if (flags.mode >= 210) {
+      wardata.timer_left--;
+  
+      if (wardata.timer_left <= 0) {
+        uint8_t token_tmp = wardata.token;
+        wardata = DMData {};
+        wardata.token = token_tmp;
+        flags.mode = M_ALARM_RINGING;
+      }
+    } 
   }
 }
