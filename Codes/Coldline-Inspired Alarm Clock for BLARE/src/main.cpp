@@ -6,8 +6,7 @@
 #include "Adafruit_ST7789.h"
 
 // Fonts
-#include "Fonts/FreeMono12pt7b.h"
-#include "Fonts/FreeMonoBold18pt7b.h"
+#include "Fonts/TomThumb.h"
 
 // Dev's QOL Configs
 #define TIME_ACCURACY 1000000
@@ -359,6 +358,10 @@ struct DMID4Data {
 struct SVector {
   uint8_t x : 7 = 0;
   uint16_t y : 9 = 0;
+  
+  void as_cursor(GFXcanvas1 *canvas) const {
+    canvas->setCursor(x, y);
+  }
 
   static SVector inverted_y(
     uint16_t x = 0,
@@ -373,6 +376,7 @@ struct SVector {
     ret.y = flipped < 0 ? 0 : flipped;
     return ret;
   }
+
 };
 
 
@@ -560,7 +564,9 @@ void print_text(GFXcanvas1 *canvas, const char *s, SVector pos1, Align alignment
 }
 
 void standby_screen_update(
+  GFXcanvas1 *canvas,
   NowReturn *time,
+  SysConfig *config,
   bool use_24h,
   bool alarm_active
 ) {
@@ -571,9 +577,54 @@ void standby_screen_update(
   const SVector sval_l = SVector::inverted_y(23, 105);
   const SVector ampmval_l = SVector::inverted_y(28, 123);
   const SVector alarmactiveval_c = SVector::inverted_y(38, 226);
-  const SVector alarmval_l = SVector::inverted_y(25, 235);
+  const SVector alarmval_c = SVector::inverted_y(38, 235);
   const SVector hint_b_1_l = SVector::inverted_y(26, 253);
   const SVector hint_b_2_l = SVector::inverted_y(15, 260);
+
+  canvas->fillScreen(MONO_1);
+  canvas->setFont(&TomThumb);
+
+  canvas->setTextSize(6);
+  hval_l.as_cursor(canvas);
+  canvas->print(use_24h ? time->h24hour : time->hour);
+  mval_l.as_cursor(canvas);
+  canvas->print(time->min);
+
+  char str[4];
+  snprintf(str, sizeof(str), "%02ds", time->sec);
+
+  canvas->setTextSize(3);
+  sval_l.as_cursor(canvas);
+  canvas->print(str);
+
+  ampmval_l.as_cursor(canvas);
+  canvas->print(use_24h ? "--" : (time->is_am ? "AM" : "PM"));
+
+  htag_l.as_cursor(canvas);
+  canvas->print("H");
+
+  mtag_l.as_cursor(canvas);
+  canvas->print("M");
+
+  canvas->setTextSize(1);
+  print_text(canvas, alarm_active ? "ALARM ACTIVE" : "ALARM NOT ACTIVE", alarmactiveval_c, A_CENTER);
+
+  const uint8_t alarm_12h = config->alarm_h24 % 12;
+  char alval[9];
+  snprintf(alval, sizeof(alval), "%02d:%02d%s",
+    use_24h ? config->alarm_h24 : (
+      alarm_12h == 0 ? 12 : alarm_12h
+    ),
+    config->alarm_m,
+    use_24h ? "" : (
+      config->alarm_h24 >= 12 ? " PM" : " AM"
+    )
+  );
+
+  hint_b_1_l.as_cursor(canvas);
+  canvas->print("PRESS B");
+  hint_b_2_l.as_cursor(canvas);
+  canvas->print("TO OPEN CONFIG");
 }
 
 void dmmenu_screen_update(
@@ -1269,7 +1320,7 @@ void config_orchestrator(SysConfig *config, SysFlags *flags, InputData *idata) {
   } else if (idata->sws_clicked[I_SW_EXIT_CONFIG]) {
     flags->mode = M_STANDBY;
     NowReturn t = time_now(config->s_offset);
-    standby_screen_update(&t, flags->use_24h, flags->alarm_active);
+    standby_screen_update(canvas, &t, config, flags->use_24h, flags->alarm_active);
     return;
   }
 
@@ -1516,7 +1567,9 @@ void loop() {
   
     if (flags.mode == M_STANDBY) {
       standby_screen_update(
+        canvas,
         &t,
+        &config,
         flags.use_24h,
         flags.alarm_active
       );
