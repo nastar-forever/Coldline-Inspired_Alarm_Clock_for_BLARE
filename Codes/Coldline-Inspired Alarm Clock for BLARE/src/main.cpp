@@ -91,9 +91,20 @@
 // DEPENDING TO
 #define D_NONE 255
 
+// COLORS
+#define MONO_1 0
+#define MONO_2 1
+#define STANDBY_COLOR_1 0x2124
+#define STANDBY_COLOR_2 0xFFFF
+#define ALARM_COLOR_1 0xF800
+#define ALARM_COLOR_2 0xFFFF
+#define GRAY_COLOR 0x630C
+#define GREEN_COLOR 0x34EC
+
 
 // Create display entity
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK);
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, -1);
+GFXcanvas1 *canvas = nullptr;
 
 // Datacontainers
 struct SysFlags {
@@ -345,6 +356,26 @@ struct DMID4Data {
 };
 
 
+struct SVector {
+  uint8_t x : 7 = 0;
+  uint16_t y : 9 = 0;
+
+  static SVector inverted_y(
+    uint16_t x = 0,
+    uint16_t y = 0,
+    uint16_t screen_w = 284,
+    uint16_t screen_h = 76
+  ) {
+    SVector ret {};
+    int16_t flipped = (screen_h - 1) - (int16_t)y; // unsign y
+
+    ret.x = x;
+    ret.y = flipped < 0 ? 0 : flipped;
+    return ret;
+  }
+};
+
+
 DMData construct_dmdata(
   uint8_t timer = 60,
   uint8_t dm_counts = 3,
@@ -510,11 +541,40 @@ void dmmenu_iinterpreter(DMMenu_IIData *idata_dmmenu, InputData *idata, uint8_t 
 
 
 // Screen updates
+enum Align {A_LEFT, A_CENTER, A_RIGHT};
+
+void print_text(GFXcanvas1 *canvas, const char *s, SVector pos1, Align alignment) {
+  int16_t bx, by;
+  uint16_t bw, bh;
+
+  canvas->getTextBounds(s, 0, 0, &bx, &by, &bw, &bh);
+
+  if (alignment == A_CENTER) {
+    pos1.x -= bw / 2;
+  } else if (alignment == A_RIGHT) {
+    pos1.x -= bw;
+  }
+
+  canvas->setCursor(pos1.x - bx, pos1.y);
+  canvas->print(s);
+}
+
 void standby_screen_update(
   NowReturn *time,
   bool use_24h,
   bool alarm_active
-) {}
+) {
+  const SVector htag_l = SVector::inverted_y(11, 23);
+  const SVector mtag_l = SVector::inverted_y(11, 64);
+  const SVector hval_l = SVector::inverted_y(27, 27);
+  const SVector mval_l = SVector::inverted_y(27, 68);
+  const SVector sval_l = SVector::inverted_y(23, 105);
+  const SVector ampmval_l = SVector::inverted_y(28, 123);
+  const SVector alarmactiveval_c = SVector::inverted_y(38, 226);
+  const SVector alarmval_l = SVector::inverted_y(25, 235);
+  const SVector hint_b_1_l = SVector::inverted_y(26, 253);
+  const SVector hint_b_2_l = SVector::inverted_y(15, 260);
+}
 
 void dmmenu_screen_update(
   NowReturn *time,
@@ -1308,12 +1368,26 @@ void setup() {
   Serial.println("HUMAN INPUT INTERFACE INITIATED");
 
   // initiate display
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
   tft.init(76, 284);
+
   // tft.setOffsets(82, 16);
   tft.invertDisplay(false);
   tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
   tft.setCursor(0, 0);
+
+  canvas = new GFXcanvas1(tft.width(), tft.height());
+
+  if (!canvas || !canvas->getBuffer()) {
+    Serial.println("CANVAS ALLOC FAILED");
+
+    tft.fillScreen(ST77XX_RED);
+    tft.setCursor(0,0);
+    tft.setTextColor(STANDBY_COLOR_2);
+    tft.print("FATAL ERROR! FAILED TO ALLOCATE CANVAS. CHECK MEMORY USAGE.");
+    while (true) delay(1000);
+  }
 
   Serial.println("TFT DISPLAY INITIATED");
   pinMode(PIN_BUZZER, OUTPUT);
